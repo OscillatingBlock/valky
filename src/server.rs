@@ -4,8 +4,8 @@ use crate::client::ClientId;
 use crate::clock::Clock;
 use crate::lease::{Lease, LeaseTable};
 use crate::protocol::{
-    ClientMessage, Message, OutgoingFromServer, OutgoingReciever, Request, Response, ServerMessage,
-    ServerMessagePayload, ServerPush,
+    AppError, ClientMessage, Message, OutgoingFromServer, OutgoingReciever, Request, Response,
+    ServerMessage, ServerMessagePayload, ServerPush,
 };
 use crate::store::{Key, Store, Value};
 
@@ -94,19 +94,22 @@ impl Server {
                         value: value,
                         lease,
                     }),
-                    None => ServerMessagePayload::Reply(Response::Error {
-                        message: String::from("no value found for key {key}"),
-                    }),
+                    None => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+                        for_key: key.clone(),
+                        error: String::from("no value found for key {key}"),
+                    })),
                 },
 
-                Err(e) => ServerMessagePayload::Reply(Response::Error {
-                    message: String::from("Internal Server Error"),
-                }),
+                Err(e) => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+                    for_key: key.clone(),
+                    error: String::from("Internal Server Error"),
+                })),
             },
 
-            Err(e) => ServerMessagePayload::Reply(Response::Error {
-                message: String::from(e.to_string()),
-            }),
+            Err(e) => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+                for_key: key.clone(),
+                error: String::from(e.to_string()),
+            })),
         };
 
         let server_msg = ServerMessage {
