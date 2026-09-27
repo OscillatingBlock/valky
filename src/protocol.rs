@@ -22,7 +22,13 @@ pub enum Request {
 pub enum Response {
     ReadOk { value: Value, lease: Lease },
     WriteOk,
-    Error { message: String },
+    Error(AppError),
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum AppError {
+    ReadErr { for_key: Key, error: String },
+    Other(String),
 }
 
 // server-initiated message to client (its not a reply to any client msg)
@@ -68,6 +74,8 @@ pub enum OutgoingReciever {
     Client(ClientId),
     Broadcast,
 }
+
+//no need for OutgoingFromClient as client msgs are always sent to server only
 
 #[derive(Clone)]
 pub struct Codec;
