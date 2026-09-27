@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-pub trait Store {
+pub trait Store: Send + Sync {
     fn get(&self, key: &Key) -> anyhow::Result<Option<Value>>;
     fn set(&self, key: Key, value: Value) -> anyhow::Result<()>;
 }
@@ -22,7 +22,7 @@ impl ServerStore {
     }
 }
 
-#[derive(Eq, PartialEq, Hash, Clone, Serialize, Deserialize)]
+#[derive(Eq, Debug, PartialEq, Hash, Clone, Serialize, Deserialize)]
 pub struct Key(String);
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Value(Bytes);
