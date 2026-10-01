@@ -27,12 +27,7 @@ pub struct LeaseTable {
 }
 
 impl LeaseTable {
-    pub fn new(
-        clock: Arc<dyn Clock>,
-        lease_duration_ms: u64,
-        skew_bound_ms: u64,
-        lease_duration: u64,
-    ) -> Self {
+    pub fn new(clock: Arc<dyn Clock>, skew_bound_ms: u64, lease_duration: u64) -> Self {
         Self {
             clock,
             skew_bound_ms,

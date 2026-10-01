@@ -13,7 +13,7 @@ use crate::{
     store::{Key, Value},
 };
 
-#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Eq, Hash)]
 pub struct ClientId(u64);
 
 pub struct ClientCache {
@@ -21,8 +21,12 @@ pub struct ClientCache {
     clock: Arc<dyn Clock>,
     client_id: ClientId,
     skew_bound_ms: u64,
-    msg_sender: tokio::sync::mpsc::Sender<Message>,
-    msg_reciever: tokio::sync::mpsc::Receiver<ServerMessage>,
+    //client cache sends msgs to (or recieves from) these channels
+    //thinking its sending them to server,
+    //behind the scenes networking module handles
+    //sending and recieving msgs from / to server
+    to_server: tokio::sync::mpsc::Sender<Message>,
+    from_server: tokio::sync::mpsc::Receiver<ServerMessage>,
 
     //list of all waiting threads for a key
     waiters_map: HashMap<Key, vec::Vec<tokio::sync::mpsc::Sender<()>>>,
@@ -33,8 +37,8 @@ impl ClientCache {
         clock: Arc<dyn Clock>,
         client_id: ClientId,
         skew_bound_ms: u64,
-        msg_sender: tokio::sync::mpsc::Sender<Message>,
-        msg_reciever: tokio::sync::mpsc::Receiver<ServerMessage>,
+        to_server: tokio::sync::mpsc::Sender<Message>,
+        from_server: tokio::sync::mpsc::Receiver<ServerMessage>,
         waiters_map: HashMap<Key, vec::Vec<tokio::sync::mpsc::Sender<()>>>,
     ) -> Self {
         Self {
@@ -42,14 +46,14 @@ impl ClientCache {
             clock,
             client_id,
             skew_bound_ms,
-            msg_sender,
-            msg_reciever,
+            to_server,
+            from_server,
             waiters_map,
         }
     }
 
     async fn dispatch_server_msgs(&mut self) {
-        while let Some(msg) = self.msg_reciever.recv().await {
+        while let Some(msg) = self.from_server.recv().await {
             match msg.payload {
                 ServerMessagePayload::Reply(server_response) => match server_response {
                     Response::ReadOk { value, lease } => {
@@ -62,6 +66,7 @@ impl ClientCache {
 
                     Response::Error(app_error) => match app_error {
                         AppError::ReadErr { error, for_key } => {
+                            //do not cache anything, just wake up waiters
                             self.wake_up_waiters(&for_key).await;
                         }
                         AppError::Other(e) => {
@@ -129,7 +134,7 @@ impl ClientCache {
             request: request,
         });
 
-        self.msg_sender.send(msg).await?;
+        self.to_server.send(msg).await?;
         Ok(())
     }
 
@@ -139,7 +144,7 @@ impl ClientCache {
             client_id: self.client_id.clone(),
             request: Request::InvalidateAck { key: key.clone() },
         });
-        if let Err(e) = self.msg_sender.send(ack).await {
+        if let Err(e) = self.to_server.send(ack).await {
             eprintln!("failed to send ack to server: {e} ");
         }
     }
@@ -164,7 +169,7 @@ impl ClientCache {
             client_id: self.client_id.clone(),
             request: Request::Write { key, value },
         });
-        self.msg_sender
+        self.to_server
             .send(msg)
             .await
             .context("failed to send write request to server")?;

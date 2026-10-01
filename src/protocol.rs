@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use crate::client::ClientId;
 use crate::lease::Lease;
@@ -7,6 +8,12 @@ use crate::store::{Key, Value};
 use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder};
+
+#[derive(Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum NodeId {
+    Client(ClientId),
+    Server(ServerId),
+}
 
 //clients send Request to server
 #[derive(Serialize, Deserialize)]
@@ -41,6 +48,12 @@ pub enum ServerPush {
 pub enum Message {
     Client(ClientMessage),
     Server(ServerMessage),
+    HandshakeType(Handshake),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Handshake {
+    pub node_id: NodeId,
 }
 
 //Client will send this, server will recieve this
@@ -86,11 +99,14 @@ impl Codec {
     }
 }
 
-impl Encoder<Message> for Codec {
+//Arc<Message> allows us to copy the message data without copying the message
+impl Encoder<Arc<Message>> for Codec {
     type Error = io::Error;
-    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let payload =
-            serde_json::to_vec(&item).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fn encode(&mut self, item: Arc<Message>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        // `&*item` dereferences the Arc into a &Message borrow,
+        // which serde_json can serialize without copying the message data.
+        let payload = serde_json::to_vec(&*item)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         dst.put_u32(payload.len() as u32);
         dst.put_slice(&payload);

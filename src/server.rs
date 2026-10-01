@@ -1,3 +1,4 @@
+use serde::de::value;
 use serde::{Deserialize, Serialize};
 
 use crate::client::ClientId;
@@ -13,54 +14,46 @@ use std::cmp;
 use std::sync::Arc;
 use std::time::Duration;
 
-// abstracts "tell client X to invalidate key Y" so tests can fake it
-pub trait ClientNotifier: Send + Sync {
-    fn send_invalidate(&self, client_id: ClientId, key: &Key);
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct ServerId(u64);
 
 pub struct Server {
     store: Arc<dyn Store>,
     leases: LeaseTable,
-    notifier: Arc<dyn ClientNotifier>,
     clock: Arc<dyn Clock>,
-    client_listener: tokio::sync::mpsc::Receiver<ClientMessage>,
-    outgoing: tokio::sync::mpsc::Sender<OutgoingFromServer>,
+    from_client: tokio::sync::mpsc::Receiver<ClientMessage>,
+    to_client: tokio::sync::mpsc::Sender<OutgoingFromServer>,
     id: ServerId,
 }
 
 impl Server {
     pub fn new(
         store: Arc<dyn Store>,
-        notifier: Arc<dyn ClientNotifier>,
         clock: Arc<dyn Clock>,
         leases: LeaseTable,
-        client_listener: tokio::sync::mpsc::Receiver<ClientMessage>,
-        outgoing: tokio::sync::mpsc::Sender<OutgoingFromServer>,
+        from_client: tokio::sync::mpsc::Receiver<ClientMessage>,
+        to_client: tokio::sync::mpsc::Sender<OutgoingFromServer>,
         id: ServerId,
     ) -> Self {
         Self {
             store,
-            notifier,
             clock,
             leases,
-            client_listener,
-            outgoing,
+            from_client,
+            to_client,
             id,
         }
     }
 
-    pub fn run(&mut self) {
-        self.dispatch_client_msgs();
+    pub async fn run(&mut self) {
+        self.handle_client_msgs().await;
     }
 
-    async fn dispatch_client_msgs(&mut self) {
-        while let Some(msg) = self.client_listener.recv().await {
+    async fn handle_client_msgs(&mut self) {
+        while let Some(msg) = self.from_client.recv().await {
             match msg.request {
                 Request::Read { key } => {
-                    self.read(&key, msg.client_id);
+                    self.read(&key, msg.client_id).await;
                 }
 
                 Request::Write { key, value } => {
@@ -68,9 +61,9 @@ impl Server {
                     let id = self.id.clone();
                     let store_clone = self.store.clone();
                     let lease_table = Arc::new(self.leases.clone());
-                    let outgoing = Arc::new(self.outgoing.clone());
+                    let to_client = Arc::new(self.to_client.clone());
                     tokio::spawn(async {
-                        write(key_clone, value, lease_table, id, outgoing, store_clone).await;
+                        write(key_clone, value, lease_table, id, to_client, store_clone).await;
                     });
                     println!("spawned writer task for key: {key:?}")
                 }
@@ -87,31 +80,41 @@ impl Server {
     }
 
     async fn read(&mut self, key: &Key, client_id: ClientId) {
-        let payload = match self.leases.grant(key.clone(), client_id.clone()) {
-            Ok(lease) => match self.store.get(key) {
-                Ok(value_opt) => match value_opt {
-                    Some(value) => ServerMessagePayload::Reply(Response::ReadOk {
-                        value: value,
-                        lease,
-                    }),
-                    None => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
-                        for_key: key.clone(),
-                        error: String::from("no value found for key {key}"),
-                    })),
-                },
-
-                Err(e) => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+        let value = match self.store.get(key) {
+            Err(e) => {
+                let payload = ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
                     for_key: key.clone(),
                     error: String::from("Internal Server Error"),
-                })),
+                }));
+                return self.send_payload_to_client(payload, client_id).await;
+            }
+            Ok(value_opt) => match value_opt {
+                Some(value) => value,
+                None => {
+                    let payload = ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+                        for_key: key.clone(),
+                        error: String::from("no value found for key {key}"),
+                    }));
+                    return self.send_payload_to_client(payload, client_id).await;
+                }
             },
+        };
 
+        let payload = match self.leases.grant(key.clone(), client_id.clone()) {
+            Ok(lease) => ServerMessagePayload::Reply(Response::ReadOk {
+                value: value,
+                lease,
+            }),
             Err(e) => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
                 for_key: key.clone(),
-                error: String::from(e.to_string()),
+                error: String::from("Internal Server Error"),
             })),
         };
 
+        return self.send_payload_to_client(payload, client_id).await;
+    }
+
+    async fn send_payload_to_client(&self, payload: ServerMessagePayload, client_id: ClientId) {
         let server_msg = ServerMessage {
             server_id: self.id.clone(),
             payload: payload,
@@ -122,7 +125,7 @@ impl Server {
             msg: Message::Server(server_msg),
         };
 
-        self.outgoing.send(outgoing).await.unwrap();
+        self.to_client.send(outgoing).await.unwrap();
     }
 
     fn on_invalidate_ack(&self, key: &Key, client_id: ClientId) {
