@@ -1,8 +1,6 @@
-use serde::de::value;
 use serde::{Deserialize, Serialize};
 
 use crate::client::ClientId;
-use crate::clock::Clock;
 use crate::lease::{Lease, LeaseTable};
 use crate::protocol::{
     AppError, ClientMessage, Message, OutgoingFromServer, OutgoingReciever, Request, Response,
@@ -20,7 +18,6 @@ pub struct ServerId(u64);
 pub struct Server {
     store: Arc<dyn Store>,
     leases: LeaseTable,
-    clock: Arc<dyn Clock>,
     from_client: tokio::sync::mpsc::Receiver<ClientMessage>,
     to_client: tokio::sync::mpsc::Sender<OutgoingFromServer>,
     id: ServerId,
@@ -29,7 +26,6 @@ pub struct Server {
 impl Server {
     pub fn new(
         store: Arc<dyn Store>,
-        clock: Arc<dyn Clock>,
         leases: LeaseTable,
         from_client: tokio::sync::mpsc::Receiver<ClientMessage>,
         to_client: tokio::sync::mpsc::Sender<OutgoingFromServer>,
@@ -37,7 +33,6 @@ impl Server {
     ) -> Self {
         Self {
             store,
-            clock,
             leases,
             from_client,
             to_client,
@@ -82,6 +77,7 @@ impl Server {
     async fn read(&mut self, key: &Key, client_id: ClientId) {
         let value = match self.store.get(key) {
             Err(e) => {
+                eprintln!("{e}");
                 let payload = ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
                     for_key: key.clone(),
                     error: String::from("Internal Server Error"),
@@ -105,10 +101,13 @@ impl Server {
                 value: value,
                 lease,
             }),
-            Err(e) => ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
-                for_key: key.clone(),
-                error: String::from("Internal Server Error"),
-            })),
+            Err(e) => {
+                eprintln!("{e}");
+                ServerMessagePayload::Reply(Response::Error(AppError::ReadErr {
+                    for_key: key.clone(),
+                    error: String::from("Internal Server Error"),
+                }))
+            }
         };
 
         return self.send_payload_to_client(payload, client_id).await;
