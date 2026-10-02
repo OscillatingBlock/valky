@@ -22,12 +22,16 @@ impl Key {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Value(Bytes);
 
 impl Value {
     pub fn from_bytes(val: Bytes) -> Value {
         Value(val)
+    }
+
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
     }
 }
 

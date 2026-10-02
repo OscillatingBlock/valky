@@ -8,7 +8,7 @@ use crate::client::ClientId;
 use crate::clock::Clock;
 use crate::store::Key;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     pub key: Key,
     pub client_id: ClientId,
