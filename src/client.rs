@@ -13,8 +13,14 @@ use crate::{
     store::{Key, Value},
 };
 
-#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Eq, Hash)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Eq, Hash, Ord, PartialOrd)]
 pub struct ClientId(u64);
+
+impl ClientId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
 
 pub struct ClientCache {
     entries: HashMap<Key, (Value, Lease)>,
