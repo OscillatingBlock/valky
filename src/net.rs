@@ -27,7 +27,6 @@ pub struct NetworkManager {
     server_addr: String,
     server_id: ServerId,
     writers_map: Arc<WritersRegistry>,
-    dispatcher_source: NetworkReceiver,
     incoming_router: IncomingRouter,
 }
 
@@ -76,7 +75,6 @@ impl NetworkManager {
     pub fn new(
         id: NodeId,
         codec: Codec,
-        dispatcher_source: NetworkReceiver,
         incoming_router: IncomingRouter,
         listener_addr: String,
         server_addr: String,
@@ -88,7 +86,6 @@ impl NetworkManager {
             codec,
             listener_addr,
             server_addr,
-            dispatcher_source,
             incoming_router,
             writers_map: Arc::new(writers_map),
             server_id,
@@ -202,42 +199,51 @@ impl NetworkManager {
     }
 
     async fn connect_with_retry(&self, addr: &str) -> Option<TcpStream> {
-        for _ in 1..=6 {
+        for attempt in 1..=6 {
             match TcpStream::connect(addr).await {
-                Ok(c) => c,
+                Ok(c) => return Some(c),
                 Err(e) => {
-                    eprintln!("failed to establish TCP connection with server, retrying {e}");
-                    continue;
+                    eprintln!(
+                        "failed to establish TCP connection with server \
+                         (attempt {attempt}/6), retrying: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             };
         }
         None
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Run this node: accept inbound connections in the background, dial the
+    /// server first if we are a client (so the server writer is registered
+    /// before anything is dispatched — otherwise early messages are dropped
+    /// as "not registered"), then dispatch outgoing messages forever.
+    pub async fn run(self, source: NetworkReceiver) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.listener_addr.as_str())
             .await
             .context("failed to bind TCP listener on given address")?;
 
-        match self.id.clone() {
-            NodeId::Client(_) => self.run_as_client(listener).await,
-            NodeId::Server(_) => self.run_as_server(listener).await,
+        let this = Arc::new(self);
+        let acceptor = Arc::clone(&this);
+        tokio::spawn(async move {
+            if let Err(e) = acceptor.listen(listener).await {
+                eprintln!("accept loop exited: {e}");
+            }
+        });
+
+        if let NodeId::Client(_) = this.id.clone() {
+            let addr = this.server_addr.clone();
+            this.dial_server(addr.as_str())
+                .await
+                .context("failed to dial server")?;
         }
-    }
 
-    pub async fn run_as_client(self, listener: TcpListener) -> anyhow::Result<()> {
-        self.listen(listener).await?;
-        self.dial_server(self.server_addr.as_str())
-            .await
-            .context("failed to dial server")?;
-
-        dispatch_outgoing(self.dispatcher_source, self.writers_map, self.server_id).await;
-        Ok(())
-    }
-
-    pub async fn run_as_server(self, listener: TcpListener) -> anyhow::Result<()> {
-        self.listen(listener).await?;
-        dispatch_outgoing(self.dispatcher_source, self.writers_map, self.server_id).await;
+        dispatch_outgoing(
+            source,
+            Arc::clone(&this.writers_map),
+            this.server_id.clone(),
+        )
+        .await;
         Ok(())
     }
 }
@@ -353,5 +359,338 @@ async fn framed_writer(
             eprintln!("failed to send message frame over TCP sink, writer exiting : {e}");
             break;
         }
+    }
+}
+
+/// Tests for the networking layer: writer registry, incoming routing,
+/// outgoing dispatch, `connect_with_retry`, and one TCP round-trip proving
+/// handshake + framed delivery work end to end.
+///
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        client::ClientId,
+        protocol::{Request, Response, ServerMessagePayload},
+        store::Key,
+    };
+
+    const SID: u64 = 1;
+
+    fn client_msg(client: u64, key: &str) -> Message {
+        Message::Client(ClientMessage {
+            client_id: ClientId::new(client),
+            request: Request::Read {
+                key: Key::from_string(key.to_string()),
+            },
+        })
+    }
+
+    fn write_ok_msg() -> Message {
+        Message::Server(ServerMessage {
+            server_id: ServerId::new(SID),
+            payload: ServerMessagePayload::Reply(Response::WriteOk),
+        })
+    }
+
+    fn read_key_of(msg: &Message) -> Key {
+        match msg {
+            Message::Client(cm) => match &cm.request {
+                Request::Read { key } => key.clone(),
+                _ => panic!("expected Read request"),
+            },
+            _ => panic!("expected Client message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_writers_registry_send_delivers_to_registered_node() {
+        let reg = WritersRegistry::default();
+        let mut rx = reg.register(NodeId::Client(ClientId::new(7))).await;
+
+        let msg = Arc::new(client_msg(7, "k"));
+        reg.send(NodeId::Client(ClientId::new(7)), Arc::clone(&msg))
+            .await
+            .unwrap();
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("no message delivered")
+            .expect("channel closed");
+        assert_eq!(read_key_of(&got), Key::from_string("k".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_writers_registry_send_to_unknown_node_errors() {
+        let reg = WritersRegistry::default();
+        let err = reg
+            .send(NodeId::Client(ClientId::new(9)), Arc::new(write_ok_msg()))
+            .await
+            .expect_err("expected error for unregistered node");
+        assert!(err.to_string().contains("not registered"));
+    }
+
+    #[tokio::test]
+    async fn test_writers_registry_get_all_clients_lists_registered_nodes() {
+        let reg = WritersRegistry::default();
+        reg.register(NodeId::Client(ClientId::new(1))).await;
+        reg.register(NodeId::Client(ClientId::new(2))).await;
+
+        let mut got = reg.get_all_clients().await;
+        got.sort_by_key(|n| match n {
+            NodeId::Client(id) => id.clone(),
+            NodeId::Server(_) => ClientId::new(u64::MAX),
+        });
+        assert_eq!(
+            got,
+            vec![
+                NodeId::Client(ClientId::new(1)),
+                NodeId::Client(ClientId::new(2))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_incoming_forwards_client_message_to_server_router() {
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(8);
+        let router = IncomingRouter::Server(tx);
+
+        route_incoming(client_msg(7, "k"), &router).await.unwrap();
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("message not forwarded")
+            .expect("channel closed");
+        assert_eq!(got.client_id, ClientId::new(7));
+    }
+
+    #[tokio::test]
+    async fn test_route_incoming_drops_client_message_on_client_router() {
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        let router = IncomingRouter::Client(tx);
+
+        // Wrong-direction message: logged and dropped, but Ok.
+        route_incoming(client_msg(7, "k"), &router).await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_route_incoming_forwards_server_message_to_client_router() {
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        let router = IncomingRouter::Client(tx);
+
+        route_incoming(write_ok_msg(), &router).await.unwrap();
+
+        let got = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("message not forwarded")
+            .expect("channel closed");
+        assert!(matches!(
+            got.payload,
+            ServerMessagePayload::Reply(Response::WriteOk)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_route_incoming_drops_server_message_on_server_router() {
+        let (tx, mut rx) = mpsc::channel::<ClientMessage>(8);
+        let router = IncomingRouter::Server(tx);
+
+        route_incoming(write_ok_msg(), &router).await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_route_incoming_ignores_handshake() {
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        let router = IncomingRouter::Client(tx);
+        let hs = Message::HandshakeType(Handshake {
+            node_id: NodeId::Server(ServerId::new(SID)),
+        });
+
+        route_incoming(hs, &router).await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_outgoing_from_server_unicast_and_broadcast() {
+        let reg = Arc::new(WritersRegistry::default());
+        let mut rx1 = reg.register(NodeId::Client(ClientId::new(1))).await;
+        let mut rx2 = reg.register(NodeId::Client(ClientId::new(2))).await;
+        let (tx, rx) = mpsc::channel::<OutgoingFromServer>(8);
+        let task = tokio::spawn(dispatch_outgoing_from_server(rx, Arc::clone(&reg)));
+
+        // Unicast reaches only its target.
+        tx.send(OutgoingFromServer {
+            to: OutgoingReciever::Client(ClientId::new(1)),
+            msg: write_ok_msg(),
+        })
+        .await
+        .unwrap();
+        let got = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("unicast not delivered")
+            .expect("channel closed");
+        assert!(matches!(&*got, Message::Server(ServerMessage { .. })));
+        assert!(rx2.try_recv().is_err());
+
+        // Broadcast reaches everyone registered.
+        tx.send(OutgoingFromServer {
+            to: OutgoingReciever::Broadcast,
+            msg: write_ok_msg(),
+        })
+        .await
+        .unwrap();
+        for rx in [&mut rx1, &mut rx2] {
+            timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("broadcast not delivered")
+                .expect("channel closed");
+        }
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_outgoing_from_client_forwards_to_server_writer() {
+        let reg = Arc::new(WritersRegistry::default());
+        let mut writer_rx = reg.register(NodeId::Server(ServerId::new(SID))).await;
+        let (tx, rx) = mpsc::channel::<Message>(8);
+        let task = tokio::spawn(dispatch_outgoing_from_client(
+            rx,
+            Arc::clone(&reg),
+            ServerId::new(SID),
+        ));
+
+        tx.send(client_msg(7, "hello")).await.unwrap();
+        let got = timeout(Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("message not forwarded to server writer")
+            .expect("channel closed");
+        assert_eq!(read_key_of(&got), Key::from_string("hello".to_string()));
+
+        task.abort();
+    }
+
+    /// Helper: a `NetworkManager` for tests that drive `handle_conn` /
+    /// dispatch directly (no listener needed).
+    fn test_manager(id: NodeId, router: IncomingRouter) -> NetworkManager {
+        NetworkManager::new(
+            id,
+            Codec::new(),
+            router,
+            String::new(),
+            String::new(),
+            ServerId::new(SID),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_retry_returns_stream_on_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mgr = test_manager(
+            NodeId::Client(ClientId::new(7)),
+            IncomingRouter::Client(mpsc::channel(8).0),
+        );
+
+        let conn = timeout(Duration::from_secs(5), mgr.connect_with_retry(&addr))
+            .await
+            .expect("connect hung");
+        assert!(conn.is_some(), "expected Some(TcpStream)");
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_retry_returns_none_when_unreachable() {
+        // Bind then drop: guaranteed closed port, connection refused fast.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mgr = test_manager(
+            NodeId::Client(ClientId::new(7)),
+            IncomingRouter::Client(mpsc::channel(8).0),
+        );
+
+        let conn = timeout(
+            Duration::from_secs(10),
+            mgr.connect_with_retry(&format!("127.0.0.1:{port}")),
+        )
+        .await
+        .expect("connect hung");
+        assert!(conn.is_none(), "expected None for refused connection");
+    }
+
+    #[tokio::test]
+    async fn test_handle_conn_handshake_and_message_flow_over_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server side: receives ClientMessages, driven dispatcher for sends.
+        let (srv_in_tx, mut srv_in_rx) = mpsc::channel::<ClientMessage>(8);
+        let server_mgr = test_manager(
+            NodeId::Server(ServerId::new(SID)),
+            IncomingRouter::Server(srv_in_tx),
+        );
+        let (srv_out_tx, srv_out_rx) = mpsc::channel::<OutgoingFromServer>(8);
+
+        // Client side: receives ServerMessages, driven dispatcher for sends.
+        let (cli_in_tx, mut cli_in_rx) = mpsc::channel::<ServerMessage>(8);
+        let client_mgr = test_manager(
+            NodeId::Client(ClientId::new(7)),
+            IncomingRouter::Client(cli_in_tx),
+        );
+        let (cli_out_tx, cli_out_rx) = mpsc::channel::<Message>(8);
+
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let cli_sock = TcpStream::connect(addr).await.unwrap();
+        let srv_sock = accept.await.unwrap();
+
+        // Both sides handshake concurrently; each learns the peer's NodeId
+        // and registers its writer tasks.
+        let (sr, cr) = tokio::join!(
+            server_mgr.handle_conn(srv_sock),
+            client_mgr.handle_conn(cli_sock)
+        );
+        sr.expect("server handshake failed");
+        cr.expect("client handshake failed");
+
+        let srv_dispatch = tokio::spawn(dispatch_outgoing_from_server(
+            srv_out_rx,
+            Arc::clone(&server_mgr.writers_map),
+        ));
+        let cli_dispatch = tokio::spawn(dispatch_outgoing_from_client(
+            cli_out_rx,
+            Arc::clone(&client_mgr.writers_map),
+            ServerId::new(SID),
+        ));
+
+        // Server -> client: invalidate-style push over the wire.
+        srv_out_tx
+            .send(OutgoingFromServer {
+                to: OutgoingReciever::Client(ClientId::new(7)),
+                msg: write_ok_msg(),
+            })
+            .await
+            .unwrap();
+        let got = timeout(Duration::from_secs(3), cli_in_rx.recv())
+            .await
+            .expect("server->client message never arrived")
+            .expect("channel closed");
+        assert!(matches!(
+            got.payload,
+            ServerMessagePayload::Reply(Response::WriteOk)
+        ));
+
+        // Client -> server: read request over the wire.
+        cli_out_tx.send(client_msg(7, "e2e")).await.unwrap();
+        let got = timeout(Duration::from_secs(3), srv_in_rx.recv())
+            .await
+            .expect("client->server message never arrived")
+            .expect("channel closed");
+        assert_eq!(got.client_id, ClientId::new(7));
+
+        srv_dispatch.abort();
+        cli_dispatch.abort();
     }
 }
