@@ -1,0 +1,27 @@
+# valky node configuration. Read at startup from ./config.toml
+# (pass --config=PATH to point elsewhere).
+#
+# Environment variables override file values. Prefix is VALKY_ and nested
+# keys join with _, e.g.:
+#   VALKY_MODE=client
+#   VALKY_SERVER_LISTEN=127.0.0.1:7000
+#   VALKY_CLIENT_SERVER=127.0.0.1:7000
+
+# Which half to run: "server" or "client". A `server` / `client` word as the
+# first command-line argument overrides this.
+mode = "server"
+
+[server]
+listen = "127.0.0.1:7000"
+id = 1
+skew_ms = 100
+lease_ms = 10000
+
+[client]
+# Address (and id) of the server to dial.
+server = "127.0.0.1:7000"
+server_id = 1
+# This client's own id (used for leases) and its inbound listen address.
+id = 7
+listen = "127.0.0.1:0"
+skew_ms = 100
