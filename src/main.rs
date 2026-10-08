@@ -3,13 +3,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use config::{Environment, File, FileFormat};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use valky::{
     client::{ClientCache, ClientId},
     clock::SystemClock,
+    config::*,
     lease::LeaseTable,
     net::{IncomingRouter, NetworkManager, NetworkReceiver},
     protocol::{Codec, Message, NodeId, ServerMessage},
@@ -17,125 +16,13 @@ use valky::{
     store::{Key, ServerStore, Store, Value},
 };
 
-/// Everything in ./config.toml (see the repo root). Missing keys fall back
-/// to the defaults below, so a minimal file with just `mode` still starts.
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    #[serde(default = "default_mode")]
-    mode: String,
-    #[serde(default)]
-    server: ServerConfig,
-    #[serde(default)]
-    client: ClientConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct ServerConfig {
-    #[serde(default = "default_listen")]
-    listen: String,
-    #[serde(default = "default_server_id")]
-    id: u64,
-    #[serde(default = "default_skew_ms")]
-    skew_ms: u64,
-    #[serde(default = "default_lease_ms")]
-    lease_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientConfig {
-    #[serde(default = "default_server_addr")]
-    server: String,
-    #[serde(default = "default_server_id")]
-    server_id: u64,
-    #[serde(default = "default_client_id")]
-    id: u64,
-    #[serde(default = "default_client_listen")]
-    listen: String,
-    #[serde(default = "default_skew_ms")]
-    skew_ms: u64,
-}
-
-fn default_mode() -> String {
-    "server".to_string()
-}
-fn default_listen() -> String {
-    "127.0.0.1:7000".to_string()
-}
-fn default_server_id() -> u64 {
-    1
-}
-fn default_client_id() -> u64 {
-    7
-}
-fn default_server_addr() -> String {
-    "127.0.0.1:7000".to_string()
-}
-fn default_client_listen() -> String {
-    "127.0.0.1:0".to_string()
-}
-fn default_skew_ms() -> u64 {
-    100
-}
-fn default_lease_ms() -> u64 {
-    10_000
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            listen: default_listen(),
-            id: default_server_id(),
-            skew_ms: default_skew_ms(),
-            lease_ms: default_lease_ms(),
-        }
-    }
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            server: default_server_addr(),
-            server_id: default_server_id(),
-            id: default_client_id(),
-            listen: default_client_listen(),
-            skew_ms: default_skew_ms(),
-        }
-    }
-}
-
-/// Load config.toml (or --config=PATH). File values win over the struct
-/// defaults above; VALKY_* env vars win over the file.
-fn load_config(config_path: &str) -> anyhow::Result<AppConfig> {
-    if !std::path::Path::new(config_path).exists() {
-        anyhow::bail!(
-            "config file not found: {config_path} (run from the project root, \
-             or pass --config=PATH; see config.toml in the repo)"
-        );
-    }
-    let settings = config::Config::builder()
-        .add_source(File::new(config_path, FileFormat::Toml))
-        // VALKY_MODE, VALKY_SERVER_LISTEN, VALKY_CLIENT_SERVER, ...
-        .add_source(Environment::with_prefix("VALKY").separator("_"))
-        .build()
-        .context("failed to load configuration")?;
-    settings
-        .try_deserialize()
-        .context("invalid configuration values")
-}
-
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // No CLI framework in this project; subcommands are hand-rolled.
     // Usage:
     //   valky server [--listen=ADDR] [--id=N] [--skew-ms=N] [--lease-ms=N]
     //   valky client --server=ADDR [--server-id=N] [--id=N] [--listen=ADDR] [--skew-ms=N]
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?
-        .block_on(async_main())
-}
 
-async fn async_main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
@@ -215,8 +102,7 @@ async fn run_client(cfg: &ClientConfig) -> anyhow::Result<()> {
     let listen = cfg.listen.clone();
 
     let (to_server_tx, to_server_rx) = tokio::sync::mpsc::channel::<Message>(512);
-    let (from_server_tx, from_server_rx) =
-        tokio::sync::mpsc::channel::<ServerMessage>(512);
+    let (from_server_tx, from_server_rx) = tokio::sync::mpsc::channel::<ServerMessage>(512);
 
     let cache = Arc::new(ClientCache::new(
         Arc::new(SystemClock),
